@@ -1,11 +1,14 @@
 from fastapi import APIRouter, HTTPException, status, Depends, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import datetime
 from bson import ObjectId
 from app.schemas.books import BookCreate, BookUpdate, BookResponse, BooksListResponse
-from app.core.security import get_current_user, get_admin_user
+from app.core.security import get_current_user
 from app.db.database import get_database
 import math
+import csv
+import io
 
 router = APIRouter(prefix="/api/books", tags=["Books"])
 
@@ -33,7 +36,6 @@ async def create_book(
     db=Depends(get_database),
     current_user=Depends(get_current_user),
 ):
-    # Check duplicate ISBN
     existing = await db["books"].find_one({"isbn": payload.isbn})
     if existing:
         raise HTTPException(status_code=400, detail="ISBN already exists")
@@ -48,11 +50,51 @@ async def create_book(
     return BookResponse(**serialize_book(book_doc))
 
 
+@router.get("/categories")
+async def get_categories(db=Depends(get_database), current_user=Depends(get_current_user)):
+    categories = await db["books"].distinct("category")
+    return {"categories": categories}
+
+
+@router.get("/export/csv")
+async def export_csv(
+    search: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    db=Depends(get_database),
+    current_user=Depends(get_current_user),
+):
+    query = {}
+    if search:
+        query["title"] = {"$regex": search, "$options": "i"}
+    if category:
+        query["category"] = {"$regex": category, "$options": "i"}
+
+    cursor = db["books"].find(query).sort("created_at", -1)
+    books = await cursor.to_list(length=10000)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["ID", "Title", "Author", "ISBN", "Category", "Price", "Stock", "Published Date", "Description"])
+    for b in books:
+        writer.writerow([
+            str(b["_id"]), b["title"], b["author"], b["isbn"],
+            b["category"], b["price"], b["stock"],
+            b.get("published_date", ""), b.get("description", "")
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=books.csv"}
+    )
+
+
 @router.get("", response_model=BooksListResponse)
 async def get_books(
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
-    search: Optional[str] = Query(None, description="Search by title"),
+    search: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
     sort_by: Optional[str] = Query("created_at", regex="^(price|published_date|created_at)$"),
     sort_order: Optional[str] = Query("desc", regex="^(asc|desc)$"),
@@ -79,12 +121,6 @@ async def get_books(
         limit=limit,
         total_pages=math.ceil(total / limit) if total > 0 else 1,
     )
-
-
-@router.get("/categories")
-async def get_categories(db=Depends(get_database), current_user=Depends(get_current_user)):
-    categories = await db["books"].distinct("category")
-    return {"categories": categories}
 
 
 @router.get("/{book_id}", response_model=BookResponse)
@@ -114,6 +150,10 @@ async def update_book(
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
 
+    # RBAC: users can only edit their own books
+    if current_user["role"] != "admin" and book.get("created_by") != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="You can only edit your own books")
+
     update_data = {k: v for k, v in payload.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -131,6 +171,14 @@ async def delete_book(
 ):
     if not ObjectId.is_valid(book_id):
         raise HTTPException(status_code=400, detail="Invalid book ID")
+    book = await db["books"].find_one({"_id": ObjectId(book_id)})
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+
+    # RBAC: users can only delete their own books
+    if current_user["role"] != "admin" and book.get("created_by") != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="You can only delete your own books")
+
     result = await db["books"].delete_one({"_id": ObjectId(book_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Book not found")

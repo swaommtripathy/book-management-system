@@ -39,4 +39,19 @@ export const booksService = {
     const res = await api.get('/api/books/categories');
     return res.data.categories;
   },
+
+  async exportCSV(params: { search?: string; category?: string } = {}): Promise<void> {
+    const res = await api.get('/api/books/export/csv', {
+      params,
+      responseType: 'blob',
+    });
+    const url = window.URL.createObjectURL(new Blob([res.data]));
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', 'books.csv');
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+  },
 };
